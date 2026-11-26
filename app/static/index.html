@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>网关日志分区运维台</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  :root { --green:#1a7f37; --orange:#bf5b00; --gray:#6e7781; --blue:#0969da; --red:#cf222e; }
+  * { box-sizing: border-box; }
+  body { font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+         margin: 0; background: #f6f8fa; color: #1f2328; }
+  header { background: #0a3069; color: #fff; padding: 14px 24px; }
+  header h1 { margin: 0; font-size: 18px; }
+  header .sub { font-size: 12px; opacity: .8; margin-top: 4px; }
+  main { max-width: 1180px; margin: 0 auto; padding: 16px 24px 48px; }
+  section { background: #fff; border: 1px solid #d0d7de; border-radius: 8px;
+            padding: 14px 16px; margin-bottom: 16px; }
+  h2 { font-size: 15px; margin: 0 0 10px; }
+  h2 .hint { font-weight: normal; color: var(--gray); font-size: 12px; margin-left: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { border: 1px solid #d0d7de; padding: 6px 8px; text-align: left; }
+  th { background: #f6f8fa; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
+  .b-attached { background: var(--green); } .b-pending { background: var(--orange); }
+  .b-detached { background: var(--gray); }
+  .b-running  { background: var(--blue); }  .b-done { background: var(--green); }
+  .b-error, .b-cancelled { background: var(--red); }
+  button { font-size: 13px; padding: 5px 12px; border: 1px solid #d0d7de; border-radius: 6px;
+           background: #f6f8fa; cursor: pointer; }
+  button:hover { background: #eaeef2; }
+  button.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+  button.warn { background: var(--orange); border-color: var(--orange); color: #fff; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  .ops button { margin-right: 8px; }
+  .ops input, .ops select { font-size: 13px; padding: 4px 6px; width: 90px; }
+  .muted { color: var(--gray); font-size: 12px; }
+  pre { background: #f6f8fa; border: 1px solid #d0d7de; border-radius: 6px;
+        padding: 8px; font-size: 12px; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
+  #toast { position: fixed; right: 16px; bottom: 16px; background: #1f2328; color: #fff;
+           padding: 8px 14px; border-radius: 6px; font-size: 13px; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>网关日志分区运维台</h1>
+  <div class="sub">按月分区 · 旧月摘除（DET&nbsp;ach&nbsp;CONCURRENTLY）· 状态以数据库系统目录为准 · <span id="now"></span></div>
+</header>
+<main>
+
+<section>
+  <h2>分区状态 <span class="hint">来自 pg_inherits / pg_class，每 3 秒自动刷新；进程重启后依然准确；行数显示 — 表示统计主动退让（摘除进行中）</span></h2>
+  <table id="part-table">
+    <thead><tr><th>分区</th><th>月份</th><th>范围</th><th>状态</th><th>行数</th><th>操作</th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div id="arch-wrap" style="margin-top:10px; display:none">
+    <div class="muted" style="margin-bottom:4px">已摘下的归档月表（独立表，可单独查询，不再出现在在线查询里）：</div>
+    <table id="arch-table">
+      <thead><tr><th>月表</th><th>月份</th><th>状态</th><th>行数</th><th>操作</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<section class="ops">
+  <h2>运维操作</h2>
+  <button class="primary" onclick="genLogs()">写入本月日志 ×200</button>
+  <button onclick="startLongQuery()">模拟旧月长查询</button>
+  <input id="lq-sec" type="number" value="120" min="5" max="3600"> 秒
+  <button class="warn" onclick="cancelLongQuery()">取消长查询</button>
+  <button onclick="resetAll()">复位：重新挂接已摘月份</button>
+  <button onclick="refresh()">立即刷新</button>
+  <div class="muted" style="margin-top:6px">
+    流程演示：先“模拟旧月长查询”→ 对旧月点“摘除”→ 摘除停在“待完成”期间点“写入本月日志”（应毫秒级返回，不被阻塞）→
+    “取消长查询”后摘除自动完成。中途重启服务可观察到状态仍是“待完成”，再点“重试完成摘除”即可续做。
+  </div>
+</section>
+
+<section>
+  <h2>后台活动 <span class="hint">pg_stat_activity 中的长查询与摘除会话</span></h2>
+  <table id="act-table">
+    <thead><tr><th>pid</th><th>会话</th><th>状态</th><th>等待事件</th><th>事务时长(s)</th><th>SQL</th></tr></thead>
+    <tbody><tr><td colspan="6" class="muted">（无）</td></tr></tbody>
+  </table>
+</section>
+
+<section>
+  <h2>作业记录 <span class="hint">仅保存在应用内存，重启即清空；分区真实状态以上方目录状态为准</span></h2>
+  <table id="job-table">
+    <thead><tr><th>时间</th><th>类型</th><th>标题</th><th>状态</th><th>详情</th></tr></thead>
+    <tbody><tr><td colspan="5" class="muted">（无）</td></tr></tbody>
+  </table>
+</section>
+
+<div class="cols">
+<section>
+  <h2>在线查询 <span class="hint">SELECT … FROM gateway_logs（父表，只含仍挂接的分区）</span></h2>
+  <button onclick="queryOnline()">查询在线日志</button>
+  <span id="online-total" class="muted"></span>
+  <pre id="online-out">（尚未查询）</pre>
+</section>
+
+<section>
+  <h2>归档查询 <span class="hint">直接查某月物理表，摘下后仍可追溯故障</span></h2>
+  <select id="arch-month"></select>
+  <button onclick="queryArchive()">查询该月表</button>
+  <span id="arch-total" class="muted"></span>
+  <pre id="arch-out">（尚未查询）</pre>
+</section>
+</div>
+
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const STATE_LABEL = { attached: '挂接中', pending: '待完成', detached: '已摘下' };
+
+async function api(path, opts) {
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.detail || r.statusText);
+  return body;
+}
+function toast(msg) {
+  const t = $('#toast'); t.textContent = msg; t.style.display = 'block';
+  setTimeout(() => t.style.display = 'none', 2600);
+}
+function esc(s) { return String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c])); }
+function fmtRows(rows) {
+  if (!rows || !rows.length) return '（0 行）';
+  return rows.map(r => `${r.ts}  ${r.gateway}  ${r.level}  #${r.id}  ${r.message}`).join('\n');
+}
+
+async function refresh() {
+  let st;
+  try { st = await api('/api/state'); }
+  catch (e) { $('#now').textContent = '后端不可达: ' + e.message; return; }
+  $('#now').textContent = '服务端时间 ' + st.now;
+
+  const pb = $('#part-table tbody'); pb.innerHTML = '';
+  const fmtN = n => n === null || n === undefined ? '—' : n;
+  for (const p of st.partitions) {
+    const btn = p.state === 'attached'
+      ? `<button class="warn" onclick="detach('${p.month}')">摘除该月</button>`
+      : `<button class="warn" onclick="detach('${p.month}')">重试完成摘除</button>`;
+    pb.insertAdjacentHTML('beforeend',
+      `<tr><td>${esc(p.name)}</td><td>${p.month}</td><td class="muted">${esc(p.bounds)}</td>
+       <td><span class="badge b-${p.state}">${STATE_LABEL[p.state]}</span></td>
+       <td>${fmtN(p.rows)}</td><td>${btn}</td></tr>`);
+  }
+  if (!st.partitions.length)
+    pb.innerHTML = '<tr><td colspan="6" class="muted">（父表当前没有挂接任何分区）</td></tr>';
+
+  $('#arch-wrap').style.display = st.archives.length ? 'block' : 'none';
+  const ab = $('#arch-table tbody'); ab.innerHTML = '';
+  for (const a of st.archives) {
+    ab.insertAdjacentHTML('beforeend',
+      `<tr><td>${esc(a.name)}</td><td>${a.month}</td>
+       <td><span class="badge b-detached">已摘下</span></td>
+       <td>${fmtN(a.rows)}</td><td><button onclick="queryArchive('${a.month}')">查询该月</button></td></tr>`);
+  }
+
+  const sel = $('#arch-month'); const cur = sel.value;
+  sel.innerHTML = st.archives.map(a => `<option value="${a.month}">${a.month}（${a.name}）</option>`).join('');
+  if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+
+  const jb = $('#job-table tbody'); jb.innerHTML = '';
+  for (const j of st.jobs) {
+    jb.insertAdjacentHTML('beforeend',
+      `<tr><td class="muted">${j.started_at}</td><td>${j.kind}</td><td>${esc(j.title)}</td>
+       <td><span class="badge b-${j.status}">${j.status}</span></td><td class="muted">${esc(j.detail)}</td></tr>`);
+  }
+  if (!st.jobs.length) jb.innerHTML = '<tr><td colspan="5" class="muted">（无）</td></tr>';
+
+  const ac = $('#act-table tbody'); ac.innerHTML = '';
+  for (const a of st.activity) {
+    ac.insertAdjacentHTML('beforeend',
+      `<tr><td>${a.pid}</td><td>${esc(a.app)}</td><td>${a.state}</td>
+       <td>${a.wait_type ? a.wait_type + ' / ' + a.wait : ''}</td>
+       <td>${a.xact_age_s ?? ''}</td><td class="muted">${esc(a.query)}</td></tr>`);
+  }
+  if (!st.activity.length) ac.innerHTML = '<tr><td colspan="6" class="muted">（无）</td></tr>';
+}
+
+async function detach(month) {
+  try {
+    const r = await api('/api/detach/' + month, { method: 'POST' });
+    toast(r.message + (r.executed ? '' : '（未执行 SQL）'));
+  } catch (e) { toast('摘除失败: ' + e.message); }
+  refresh();
+}
+async function genLogs() {
+  try {
+    const t0 = performance.now();
+    const r = await api('/api/logs/generate', { method: 'POST',
+      headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ count: 200 }) });
+    toast(`写入 ${r.inserted} 行，服务端耗时 ${r.elapsed_ms}ms（未被摘除阻塞）`);
+  } catch (e) { toast('写入失败: ' + e.message); }
+  refresh();
+}
+async function startLongQuery() {
+  const seconds = parseInt($('#lq-sec').value || '120', 10);
+  try { await api('/api/simulate/long-query', { method: 'POST',
+    headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ seconds }) });
+    toast('长查询已启动'); } catch (e) { toast(e.message); }
+  refresh();
+}
+async function cancelLongQuery() {
+  try { const r = await api('/api/simulate/long-query/cancel', { method: 'POST' });
+    toast('已取消 ' + r.cancelled + ' 个长查询'); } catch (e) { toast(e.message); }
+  refresh();
+}
+async function resetAll() {
+  try { const r = await api('/api/reset', { method: 'POST' });
+    toast('复位完成：重新挂接 ' + (r.reattached.join(', ') || '无')); }
+  catch (e) { toast('复位失败: ' + e.message); }
+  refresh();
+}
+async function queryOnline() {
+  const r = await api('/api/logs/online?limit=15');
+  $('#online-total').textContent = `父表共 ${r.total} 行（仅仍挂接分区）`;
+  $('#online-out').textContent = fmtRows(r.rows);
+}
+async function queryArchive(m) {
+  const month = m || $('#arch-month').value;
+  if (!month) { toast('暂无已摘下的归档月表'); return; }
+  try {
+    const r = await api('/api/logs/archive/' + month + '?limit=15');
+    $('#arch-total').textContent = `${r.table} 共 ${r.total} 行（状态 ${STATE_LABEL[r.state]}）`;
+    $('#arch-out').textContent = fmtRows(r.rows);
+  } catch (e) { toast(e.message); }
+}
+
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>
