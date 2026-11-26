@@ -28,7 +28,11 @@ docker compose up --build
 - **模拟旧月长查询 / 取消**：复现"长查询拖住摘除第二阶段"的场景。
 - **在线查询**：`SELECT ... FROM gateway_logs`（父表，只含仍挂接的分区）。
 - **归档查询**：直接查某月物理表（如 `gateway_logs_2026_10`），摘下后仍可追溯。
-- **复位**：把已摘下的月份重新 `ATTACH` 回去，便于反复演练。
+- **复位**：把已摘下的月份重新 `ATTACH` 回去、补建缺失的月表，便于反复演练。
+  复位是**单事务**：任一月份失败（归档表含越界记录、注册表月界不符、拿不到月表锁）
+  就整次回滚，先挂回的月份不会留在父表上；页面会用红条指出出错的月份和原因。
+  存在“待完成”摘除时拒绝复位并提示先完成摘除；旧月表锁等待上限 800ms，
+  拿不到锁时 1 秒内返回“稍后重试”。检查月界/等锁期间本月日志照常写入。
 
 ## 状态与数据库目录的对应
 
@@ -49,10 +53,30 @@ docker compose up --build
 
 # 复现 2：摘除中途重启服务（操作中断），重启后按目录显示"待完成"，重试续做
 ./scripts/demo_interrupt.sh
+
+# 复现 3：复位演练——正常回执、第二个月挂接失败整次回滚、待完成摘除时拒绝
+./scripts/demo_reset.sh
 ```
 
 脚本默认打 `http://localhost:8000`，可用 `BASE_URL` 覆盖；
-`demo_interrupt.sh` 默认用 `docker compose restart app` 制造中断，可用 `RESTART_CMD` 覆盖。
+`demo_interrupt.sh` 默认用 `docker compose restart app` 制造中断，可用 `RESTART_CMD` 覆盖；
+`demo_reset.sh` 用 `docker compose cp/exec` 把失败样例送进 db 容器，可用 `COMPOSE` 覆盖。
+
+### 复位失败样例（第二个月挂接报错）
+
+`db/samples/reset_second_month_fails.sql` 会把“再上个月”（空表）和“上月”
+都摘下，并给“上月”写入一行越界记录。点“复位”后：
+
+1. “再上个月”先被建表/挂回；
+2. 轮到“上月”时因越界记录失败，接口返回 409；
+3. 整次复位回滚——“再上个月”仍为“已摘下”，在线日志总行数不变；
+4. 页面红条显示：`月份 2026-10（gateway_logs_2026_10）：归档月表含越界记录…`。
+
+```bash
+docker compose cp db/samples/reset_second_month_fails.sql db:/tmp/
+docker compose exec -T db psql -U ops -d gateway -f /tmp/reset_second_month_fails.sql
+# 然后在页面点“复位”，或：curl -X POST localhost:8000/api/reset
+```
 
 ## 关键机制与实测发现
 
@@ -94,18 +118,20 @@ docker compose up --build
 | GET | `/api/logs/archive/{month}` | 归档查询（指定月物理表） |
 | POST | `/api/simulate/long-query` | 模拟旧月长查询 `{seconds}` |
 | POST | `/api/simulate/long-query/cancel` | 取消长查询（含僵尸会话） |
-| POST | `/api/reset` | 复位：重新挂接已摘月份 |
+| POST | `/api/reset` | 复位：重新挂接已摘月份（单事务，失败整次回滚） |
 
 ## 目录结构
 
 ```
 compose.yaml              # db(postgres:16) + app(FastAPI)
 db/init/01_init.sql       # 建分区表、预置旧月+本月分区与样例数据
+db/samples/reset_second_month_fails.sql  # 复位在第二个月挂接失败的样例（手动执行）
 app/Dockerfile            # python:3.12-slim + uvicorn
 app/main.py               # 运维 API 与后台摘除/长查询作业
 app/static/index.html     # 运维页面（中文，3 秒轮询）
 scripts/demo_concurrent.sh  # 复现：长查询不阻塞写入、并发摘除
 scripts/demo_interrupt.sh   # 复现：中断后按目录显示、重试续做
+scripts/demo_reset.sh       # 复现：复位成功回执 / 第二个月失败整次回滚 / 待完成拒绝
 ```
 
 ## 说明与限制
@@ -113,5 +139,12 @@ scripts/demo_interrupt.sh   # 复现：中断后按目录显示、重试续做
 - 月份边界按数据库服务器时区（容器内 UTC）计算；生产环境可按业务时区调整。
 - 行数统计在摘除进行中会主动退让显示"—"，稍候刷新即可看到精确值。
 - `partition_registry` 只存月份边界用于复位展示；分区真实状态一律以系统目录为准。
+- 复位对照的月界来自注册表；挂回前会核对注册表月界与月份名一致，并检查归档表
+  是否存在落在月界外的 `ts`（只取越界样例，不整表计数）。
+- 补建缺失月表时用 `CREATE TABLE ... (LIKE gateway_logs INCLUDING ALL)` 再 `ATTACH`，
+  而不是 `CREATE TABLE ... PARTITION OF`——后者要取父表 `ACCESS EXCLUSIVE` 锁，
+  会短暂阻塞本月写入；前者只取 `ACCESS SHARE`（LIKE）和 `SHARE UPDATE EXCLUSIVE`（ATTACH）。
+- 复位接口的锁等待上限 800ms，因此“拿不到旧月表锁”总在 1 秒内返回；查询本身
+  扫描归档表的耗时不在这 1 秒口径内（大表检查可能更久）。
 - 如需强制清理僵尸会话，可用页面"取消长查询"或 `pg_terminate_backend`；
   生产环境可考虑设置 `client_connection_check_interval`。

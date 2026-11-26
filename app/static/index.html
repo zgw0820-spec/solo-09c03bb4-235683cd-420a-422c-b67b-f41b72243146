@@ -40,6 +40,10 @@
   @media (max-width: 900px) { .cols { grid-template-columns: 1fr; } }
   #toast { position: fixed; right: 16px; bottom: 16px; background: #1f2328; color: #fff;
            padding: 8px 14px; border-radius: 6px; font-size: 13px; display: none; }
+  #reset-result { display: none; margin-top: 10px; padding: 8px 12px; border-radius: 6px;
+                  font-size: 13px; line-height: 1.5; white-space: pre-wrap; }
+  #reset-result.ok  { background: #dafbe1; border: 1px solid #1a7f37; color: #0a3622; }
+  #reset-result.err { background: #ffebe9; border: 1px solid #cf222e; color: #82071e; }
 </style>
 </head>
 <body>
@@ -72,6 +76,7 @@
   <button class="warn" onclick="cancelLongQuery()">取消长查询</button>
   <button onclick="resetAll()">复位：重新挂接已摘月份</button>
   <button onclick="refresh()">立即刷新</button>
+  <div id="reset-result"></div>
   <div class="muted" style="margin-top:6px">
     流程演示：先“模拟旧月长查询”→ 对旧月点“摘除”→ 摘除停在“待完成”期间点“写入本月日志”（应毫秒级返回，不被阻塞）→
     “取消长查询”后摘除自动完成。中途重启服务可观察到状态仍是“待完成”，再点“重试完成摘除”即可续做。
@@ -121,7 +126,14 @@ const STATE_LABEL = { attached: '挂接中', pending: '待完成', detached: '�
 async function api(path, opts) {
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(body.detail || r.statusText);
+  if (!r.ok) {
+    let msg = body.detail;
+    if (msg && typeof msg === 'object') {
+      if (msg.month) msg = `月份 ${msg.month}` + (msg.relation ? `（${msg.relation}）` : '') + '：' + msg.reason;
+      else msg = msg.reason || JSON.stringify(msg);
+    }
+    throw new Error(msg || r.statusText);
+  }
   return body;
 }
 function toast(msg) {
@@ -214,9 +226,21 @@ async function cancelLongQuery() {
   refresh();
 }
 async function resetAll() {
-  try { const r = await api('/api/reset', { method: 'POST' });
-    toast('复位完成：重新挂接 ' + (r.reattached.join(', ') || '无')); }
-  catch (e) { toast('复位失败: ' + e.message); }
+  const box = $('#reset-result');
+  box.style.display = 'none';
+  try {
+    const r = await api('/api/reset', { method: 'POST' });
+    const re = r.reattached.join(', ') || '无';
+    const cr = r.recreated.join(', ') || '无';
+    box.className = 'ok';
+    box.textContent = `复位成功：重新挂接 ${re}；补建 ${cr}`;
+    toast('复位完成：重新挂接 ' + re);
+  } catch (e) {
+    box.className = 'err';
+    box.textContent = '复位失败（本次复位未生效，先挂回的月份已回滚）：\n' + e.message;
+    toast('复位失败: ' + e.message);
+  }
+  box.style.display = 'block';
   refresh();
 }
 async function queryOnline() {

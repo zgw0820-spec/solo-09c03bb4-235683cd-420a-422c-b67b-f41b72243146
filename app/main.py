@@ -20,6 +20,10 @@
    或 count(*) 查该分区）都会与它形成死锁，且 FINALIZE 会自我了断。
    因此轮询接口一律不打开分区表：边界取自注册表，行数统计走独立连接并
    设置 lock_timeout=800ms（小于 deadlock_timeout=1s，保证退让的是自己）。
+3. 复位必须单事务：早期实现逐条 autocommit 挂回，遇到含越界记录的归档表时
+   前面的月份已经挂回，在线查询凭空多出旧月行数；现在整次复位要么全成、要么
+   全回滚。补建月表也改用 CREATE ... (LIKE parent INCLUDING ALL) + ATTACH，
+   避免 CREATE ... PARTITION OF 的父表 ACCESS EXCLUSIVE 锁阻塞本月写入。
 """
 import os
 import re
@@ -43,6 +47,9 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # 轮询/查询连接的锁等待上限：必须小于 deadlock_timeout(默认1s)，
 # 保证与 FINALIZE 竞争时永远是我们退让，摘除作业绝不当死锁牺牲品。
 POLL_LOCK_TIMEOUT_MS = 800
+# 复位是同步接口：拿不到旧月表的锁时，必须在 1 秒内返回“请稍后重试”。
+# 800ms 的锁等待上限给响应留出余量。
+RESET_LOCK_TIMEOUT_MS = 800
 
 
 # ---------------------------------------------------------------- 基础工具
@@ -450,26 +457,185 @@ def cancel_long_query():
     return {"cancelled": sum(1 for r in rows if r["ok"])}
 
 
+class ResetFailure(Exception):
+    """复位失败：带出错月份与原因，供接口与页面展示。"""
+
+    def __init__(self, reason: str, month: str | None = None,
+                 relation: str | None = None, code: str = "reset_failed"):
+        super().__init__(reason)
+        self.month, self.relation, self.reason, self.code = month, relation, reason, code
+
+
+def reset_month_bounds(c, month: str) -> tuple[datetime, datetime]:
+    """由月份名推导月界（按数据库会话时区，容器内为 UTC），用于核对注册表。"""
+    row = c.execute(
+        "SELECT %s::timestamptz AS lo, %s::timestamptz + interval '1 month' AS up",
+        (f"{month}-01", f"{month}-01"),
+    ).fetchone()
+    return row["lo"], row["up"]
+
+
+def check_registry_bounds(c, registry: dict):
+    """核对注册表：月份格式、月界与月份名一致、相邻月份不重叠。
+
+    这一步只读注册表，不打开任何月表，也就不会参与摘除所需的表锁。
+    """
+    expected = {}
+    for month in sorted(registry):
+        if not MONTH_RE.match(month):
+            raise ResetFailure(
+                f"注册表中的月份格式非法: {month!r}，应为 YYYY-MM",
+                month=month, code="bounds_mismatch",
+            )
+        lo, up = reset_month_bounds(c, month)
+        expected[month] = (lo, up)
+        reg_lo, reg_up = registry[month]["lower"], registry[month]["upper"]
+        if reg_lo != lo or reg_up != up:
+            raise ResetFailure(
+                f"注册表月界与月份不符：登记为 [{reg_lo.isoformat()}, {reg_up.isoformat()})，"
+                f"按 {month} 应为 [{lo.isoformat()}, {up.isoformat()})",
+                month=month, relation=part_name(month), code="bounds_mismatch",
+            )
+    months = sorted(expected)
+    for prev, nxt in zip(months, months[1:]):
+        if expected[prev][1] > expected[nxt][0]:
+            raise ResetFailure(
+                f"注册表月界重叠：{prev} 的上界 {expected[prev][1].isoformat()} "
+                f"晚于 {nxt} 的下界 {expected[nxt][0].isoformat()}",
+                month=nxt, relation=part_name(nxt), code="bounds_overlap",
+            )
+
+
+def set_reset_lock_timeout(c):
+    """锁等待上限 800ms（小于 1 秒）：拿不到旧月表锁就立刻退让。
+
+    逐月处理时只有“卡住的那一个月”会等满 800ms，随后整次复位立即回滚，
+    因此从点击复位到收到“稍后重试”不超过 1 秒。
+    查询自身执行耗时（如扫描归档表）不计入锁等待。
+    """
+    c.execute(f"SET lock_timeout = '{RESET_LOCK_TIMEOUT_MS}ms'")
+
+
+def check_archive_rows(c, month: str, name: str, lo: datetime, up: datetime):
+    """挂回前检查归档月表的数据是否都落在登记月界内。
+
+    只对旧月表加 AccessShareLock（不碰父表），因此本月写入不受影响；
+    若月表正被摘除/收尾锁定，lock_timeout 会让它快速退让并由调用方提示重试。
+    只取少量越界样例（命中 ts 索引即停），不整表 count，避免大月表长时间扫描。
+    """
+    bad = c.execute(
+        f'SELECT ts FROM "{name}" WHERE ts IS NULL OR ts < %s OR ts >= %s '
+        f"ORDER BY ts NULLS FIRST LIMIT 3",
+        (lo, up),
+    ).fetchall()
+    if bad:
+        shown = ", ".join("ts 为空" if r["ts"] is None else r["ts"].isoformat() for r in bad)
+        raise ResetFailure(
+            f"归档月表含越界记录（示例: {shown}；可能不止这些），"
+            f"登记月界为 [{lo.isoformat()}, {up.isoformat()})，无法挂回父表",
+            month=month, relation=name, code="bounds_violation",
+        )
+
+
 @app.post("/api/reset")
 def reset():
-    """把注册表中已摘下的月份重新挂接回去（演示复位用）。有待完成摘除时拒绝。"""
+    """把注册表中已摘下的月份重新挂接回去，缺失的月表补建（演示复位用）。
+
+    - 有待完成摘除时直接拒绝，不做任何复位；
+    - 所有月份在同一个事务里处理：任一月份失败（月界不符、拿不到月表锁等）
+      就整体回滚，先挂回的月份不会留在父表上；
+    - 锁等待上限 800ms（小于 1 秒），拿不到旧月表锁时立即提示稍后重试。
+    """
     with connect() as c:
         pend = [p["name"] for p in fetch_partitions(c) if p["pending"]]
         if pend:
-            raise HTTPException(409, "存在待完成摘除: " + ", ".join(pend) +
-                                "，请先重试完成（FINALIZE）再复位")
+            raise HTTPException(409, detail={
+                "code": "pending_detach", "months": [month_of(p) for p in pend],
+                "reason": "存在待完成摘除: " + ", ".join(pend) +
+                          "，请先完成摘除（FINALIZE）再复位；本次未做任何复位",
+            })
+
+    reattached, recreated = [], []
+    # 单事务：CREATE/ATTACH 均可回滚，保证“任一月份失败，整次复位都不生效”。
+    c = psycopg.connect(DB_DSN, autocommit=False, row_factory=dict_row)
+    month = None
+    try:
+        set_reset_lock_timeout(c)
+        # 在事务内重新确认：避免检查与复位之间冒出待完成摘除、注册表被改动。
+        pend = [p["name"] for p in fetch_partitions(c) if p["pending"]]
+        if pend:
+            raise ResetFailure(
+                "存在待完成摘除: " + ", ".join(pend) +
+                "，请先完成摘除（FINALIZE）再复位",
+                month=month_of(pend[0]), relation=pend[0], code="pending_detach",
+            )
         registry = fetch_registry(c)
-        reattached, recreated = [], []
+        check_registry_bounds(c, registry)
+
         for month in sorted(registry):
-            name, st = part_name(month), partition_state(c, month)
-            lo = registry[month]["lower"].isoformat()
-            up = registry[month]["upper"].isoformat()
+            name = part_name(month)
+            lo, up = registry[month]["lower"], registry[month]["upper"]
+            st = partition_state(c, month)
+            if st == "attached":
+                continue
+            if st == "pending":
+                raise ResetFailure(
+                    "分区处于待完成摘除状态，请先完成摘除（FINALIZE）再复位",
+                    month=month, relation=name, code="pending_detach",
+                )
             if st == "detached":
-                c.execute(f'ALTER TABLE {PARENT} ATTACH PARTITION "{name}" '
-                          f"FOR VALUES FROM ('{lo}') TO ('{up}')")
+                check_archive_rows(c, month, name, lo, up)
+                c.execute(
+                    f'ALTER TABLE {PARENT} ATTACH PARTITION "{name}" '
+                    f"FOR VALUES FROM ('{lo.isoformat()}') TO ('{up.isoformat()}')"
+                )
                 reattached.append(name)
-            elif st == "missing":
-                c.execute(f'CREATE TABLE "{name}" PARTITION OF {PARENT} '
-                          f"FOR VALUES FROM ('{lo}') TO ('{up}')")
+            else:  # missing：先按父表结构建普通表，再挂接
+                # 不直接 CREATE TABLE ... PARTITION OF：那会取父表 ACCESS EXCLUSIVE
+                # 锁，短暂阻塞本月写入；LIKE 只取 ACCESS SHARE，ATTACH 只取
+                # SHARE UPDATE EXCLUSIVE，本月写入全程不受阻。
+                # EXCLUDING IDENTITY 与“PARTITION OF 建出的分区”结构一致：
+                # id 由父表身份列生成，分区自己不再持有独立序列，避免直插分区时冲突。
+                c.execute(f'CREATE TABLE "{name}" '
+                          f"(LIKE {PARENT} INCLUDING ALL EXCLUDING IDENTITY)")
+                c.execute(
+                    f'ALTER TABLE {PARENT} ATTACH PARTITION "{name}" '
+                    f"FOR VALUES FROM ('{lo.isoformat()}') TO ('{up.isoformat()}')"
+                )
                 recreated.append(name)
+        c.commit()
+    except ResetFailure as e:
+        c.rollback()
+        detail = {"code": e.code, "reason": e.reason, "rolled_back": True}
+        if e.month:
+            detail["month"] = e.month
+        if e.relation:
+            detail["relation"] = e.relation
+        raise HTTPException(409, detail=detail)
+    except (psycopg.errors.LockNotAvailable, psycopg.errors.DeadlockDetected) as e:
+        c.rollback()
+        # 锁等待上限 800ms，保证 1 秒内把“稍后重试”交回页面。
+        target = f"月表 {part_name(month)} " if month else "所需的表"
+        detail = {
+            "code": "lock_timeout",
+            "reason": f"等待{target}的锁超时（{str(e).splitlines()[0]}），"
+                      f"请稍后重试；本次复位已全部回滚",
+            "rolled_back": True,
+        }
+        if month:
+            detail["month"] = month
+        raise HTTPException(409, detail=detail)
+    except Exception as e:
+        c.rollback()
+        detail = {
+            "code": "reset_failed",
+            "reason": f"复位失败：{str(e).strip()}；本次复位已全部回滚",
+            "rolled_back": True,
+        }
+        if month:
+            detail.update(month=month, relation=part_name(month))
+        raise HTTPException(409, detail=detail)
+    finally:
+        c.close()
+    # 保留原有成功回执结构。
     return {"reattached": reattached, "recreated": recreated}

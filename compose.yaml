@@ -9,6 +9,7 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
       - ./db/init:/docker-entrypoint-initdb.d:ro   # 首次启动建表、预置旧月+本月分区和样例数据
+      - ./db/samples:/samples:ro                   # 复位失败样例，手动执行，不会自动运行
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ops -d gateway"]
       interval: 2s
